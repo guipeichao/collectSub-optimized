@@ -71,10 +71,13 @@ def get_config(config_path: str = "config.yaml") -> List[str]:
 
 
 def normalize_candidate_url(raw_url: str) -> Optional[str]:
-    url = html.unescape(raw_url).strip()
-    url = unquote(url)
-    url = url.rstrip(TRAILING_PUNCTUATION)
-    lower_url = url.lower()
+    try:
+        url = html.unescape(raw_url).strip()
+        url = unquote(url)
+        url = url.rstrip(TRAILING_PUNCTUATION)
+        lower_url = url.lower()
+    except Exception:
+        return None
 
     if url.startswith("//"):
         url = f"https:{url}"
@@ -94,14 +97,17 @@ def extract_candidate_urls(text: str) -> List[str]:
 
     # Some pages wrap the real target in encoded query parameters.
     for candidate in list(candidates):
-        decoded_candidate = unquote(candidate)
-        candidates.update(SUB_URL_PATTERN.findall(decoded_candidate))
-        candidates.update(NODE_URL_PATTERN.findall(decoded_candidate))
-        for _, value in parse_qsl(urlparse(decoded_candidate).query):
-            candidates.update(SUB_URL_PATTERN.findall(value))
-            candidates.update(NODE_URL_PATTERN.findall(value))
-            if value.startswith(("http://", "https://", *NODE_SCHEMES)):
-                candidates.add(value)
+        try:
+            decoded_candidate = unquote(candidate)
+            candidates.update(SUB_URL_PATTERN.findall(decoded_candidate))
+            candidates.update(NODE_URL_PATTERN.findall(decoded_candidate))
+            for _, value in parse_qsl(urlparse(decoded_candidate).query):
+                candidates.update(SUB_URL_PATTERN.findall(value))
+                candidates.update(NODE_URL_PATTERN.findall(value))
+                if value.lower().startswith(("http://", "https://", *NODE_SCHEMES)):
+                    candidates.add(value)
+        except Exception as exc:
+            logger.debug("跳过异常候选链接 {}: {}", candidate, exc)
 
     urls = set()
     for candidate in candidates:
@@ -126,8 +132,14 @@ def get_channel_http(channel_url: str) -> List[str]:
         logger.warning("{} 获取失败: {}", channel_url, exc)
         return []
 
-    logger.info("{} 获取成功", channel_url)
-    return extract_candidate_urls(resp.text)
+    try:
+        urls = extract_candidate_urls(resp.text)
+    except Exception as exc:
+        logger.warning("{} 链接提取失败: {}", channel_url, exc)
+        return []
+
+    logger.info("{} 获取成功，提取到 {} 个候选链接", channel_url, len(urls))
+    return urls
 
 
 def filter_base64(text: str) -> bool:
@@ -175,7 +187,10 @@ def sub_check(url: str) -> Optional[str]:
 def collect_channel_urls(channels: Iterable[str]) -> List[str]:
     urls: Set[str] = set()
     for channel_url in channels:
-        urls.update(get_channel_http(channel_url))
+        try:
+            urls.update(get_channel_http(channel_url))
+        except Exception as exc:
+            logger.warning("{} 处理失败，已跳过: {}", channel_url, exc)
     return sorted(urls)
 
 
