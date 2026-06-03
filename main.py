@@ -1,9 +1,11 @@
 import base64
 import binascii
+import html
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
+from urllib.parse import parse_qsl, unquote, urlparse
 
 import requests
 import yaml
@@ -16,7 +18,10 @@ from pre_check import pre_check
 
 SUB_KEYS = ("机场订阅", "clash订阅", "v2订阅")
 SUB_URL_PATTERN = re.compile(r"https?://[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]")
-NODE_SCHEMES = ("ss://", "ssr://", "vmess://", "trojan://")
+HREF_PATTERN = re.compile(r"""href=["']([^"']+)["']""", re.IGNORECASE)
+NODE_SCHEMES = ("ss://", "ssr://", "vmess://", "vless://", "trojan://")
+NODE_URL_PATTERN = re.compile(r"(?:ss|ssr|vmess|vless|trojan)://[^\s<>'\"\\]+", re.IGNORECASE)
+TRAILING_PUNCTUATION = ".,;:!?)]}，。；：！？）】》\"'"
 REQUEST_TIMEOUT = 10
 MAX_WORKERS = 32
 
@@ -65,6 +70,48 @@ def get_config(config_path: str = "config.yaml") -> List[str]:
     return sorted(set(result))
 
 
+def normalize_candidate_url(raw_url: str) -> Optional[str]:
+    url = html.unescape(raw_url).strip()
+    url = unquote(url)
+    url = url.rstrip(TRAILING_PUNCTUATION)
+    lower_url = url.lower()
+
+    if url.startswith("//"):
+        url = f"https:{url}"
+        lower_url = url.lower()
+    if lower_url.startswith(("http://", "https://", *NODE_SCHEMES)):
+        return url
+    return None
+
+
+def extract_candidate_urls(text: str) -> List[str]:
+    decoded = html.unescape(text)
+    candidates = set()
+
+    candidates.update(SUB_URL_PATTERN.findall(decoded))
+    candidates.update(NODE_URL_PATTERN.findall(decoded))
+    candidates.update(HREF_PATTERN.findall(decoded))
+
+    # Some pages wrap the real target in encoded query parameters.
+    for candidate in list(candidates):
+        decoded_candidate = unquote(candidate)
+        candidates.update(SUB_URL_PATTERN.findall(decoded_candidate))
+        candidates.update(NODE_URL_PATTERN.findall(decoded_candidate))
+        for _, value in parse_qsl(urlparse(decoded_candidate).query):
+            candidates.update(SUB_URL_PATTERN.findall(value))
+            candidates.update(NODE_URL_PATTERN.findall(value))
+            if value.startswith(("http://", "https://", *NODE_SCHEMES)):
+                candidates.add(value)
+
+    urls = set()
+    for candidate in candidates:
+        normalized = normalize_candidate_url(candidate)
+        if normalized:
+            urls.add(normalized)
+
+    return sorted(urls)
+
+
 def get_channel_http(channel_url: str) -> List[str]:
     headers = {
         "User-Agent": (
@@ -73,14 +120,14 @@ def get_channel_http(channel_url: str) -> List[str]:
         )
     }
     try:
-        resp = requests.get(channel_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(channel_url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         resp.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("{} 获取失败: {}", channel_url, exc)
         return []
 
     logger.info("{} 获取成功", channel_url)
-    return SUB_URL_PATTERN.findall(resp.text)
+    return extract_candidate_urls(resp.text)
 
 
 def filter_base64(text: str) -> bool:
@@ -97,15 +144,18 @@ def looks_like_v2_subscription(text: str) -> bool:
     return filter_base64(decoded)
 
 
-@retry(tries=2, delay=1)
+@retry(tries=3, delay=1)
 def fetch_subscription(url: str) -> requests.Response:
     headers = {"User-Agent": "ClashforWindows/0.18.1"}
-    response = requests.get(url, headers=headers, timeout=5)
+    response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
     response.raise_for_status()
     return response
 
 
 def sub_check(url: str) -> Optional[str]:
+    if url.lower().startswith(NODE_SCHEMES):
+        return "v2订阅"
+
     try:
         response = fetch_subscription(url)
     except requests.RequestException:
@@ -115,6 +165,8 @@ def sub_check(url: str) -> Optional[str]:
         return "机场订阅"
     if "proxies:" in response.text:
         return "clash订阅"
+    if filter_base64(response.text):
+        return "v2订阅"
     if looks_like_v2_subscription(response.text):
         return "v2订阅"
     return None
